@@ -11,12 +11,15 @@ var EventEmitter = require('events').EventEmitter;
  *   @property {String} redis Redis connection string.
  *   @property {String=} namespace - An optional namespace under which to prefix all Redis keys and
  *     channels used by this lock.
+ *   @property {Integer} number maximum number of allowed connections, defaults to 1
  */
 function Lock(options) {
   options = options || {};
   options.namespace = options.namespace || 'lock';
+  options.number = options.number || 1;
 
   this._namespace = options.namespace;
+  this._number = options.number;
 
   // Create Redis connection for issuing normal commands
   this._redisConnection = redis.createClient(options.redis);
@@ -64,10 +67,34 @@ Object.assign(Lock.prototype, {
    * @param {Function} done Callback
    */
   acquireLock: function(id, ttl, done) {
+    // HACKY WAY OF DECREMENTING COUNTER AFTER A LOCK EXPIRES (but the key doesn't)
+    var decrementScript = `
+      redis.call("HINCRBY", KEYS[1], "counter", -1);
+    `;
+
+    var decrementCount = () => {
+      this._scripty.loadScript('decrementScript', decrementScript, (err, script) => {
+        if (err) return done(err);
+        script.run(1, `${this._namespace}:${id}`, (err, evalResponse) => {
+          // if (err) return done(err); decide error out?
+        });
+      });
+    }
+
+
+
     var acquireScript = `
         local ttl=tonumber(ARGV[1]);
+        local number=tonumber(ARGV[2]);
         if redis.call("EXISTS", KEYS[1]) == 1 then
-          return {0, -1, redis.call("PTTL", KEYS[1])};
+          if tonumber(redis.call("HGET", KEYS[1], "counter")) == number then
+            return {0, -1, redis.call("PTTL", KEYS[1]), 9999};
+          else
+            redis.call("HINCRBY", KEYS[1], "counter", 1);
+            redis.call("PEXPIRE", KEYS[1], ttl);
+            return {1, redis.call("HGET", KEYS[1], "index"), ttl, tonumber(redis.call("HGET", KEYS[1], "counter"))};
+          end;
+          
         end;
         --[[
           Use a global incrementing counter
@@ -77,22 +104,24 @@ Object.assign(Lock.prototype, {
           of years to reach that limit assuming we make 100k incrementations in a second
         --]]
         local index = redis.call("INCR", KEYS[2]);
-        redis.call("HMSET", KEYS[1], "index", index);
+        redis.call("HMSET", KEYS[1], "index", index, "counter", 1);
         redis.call("PEXPIRE", KEYS[1], ttl);
-        return {1, index, ttl};
+        return {1, index, ttl, 1};
       `;
 
     this._scripty.loadScript('acquireScript', acquireScript, (err, script) => {
       if (err) return done(err);
-
-      script.run(2, `${this._namespace}:${id}`, `${this._namespace}index`, ttl, (err, evalResponse) => {
+      script.run(2, `${this._namespace}:${id}`, `${this._namespace}index`, ttl, `${this._number}`, (err, evalResponse) => {
         if (err) return done(err);
+
+        setTimeout(() => decrementCount(), ttl);
 
         var response = {
           id: id,
           success: !!evalResponse[0],
           index: evalResponse[1],
-          ttl: evalResponse[2]
+          ttl: evalResponse[2],
+          counter: evalResponse[3]
         };
         done(null, response);
       });
@@ -119,13 +148,18 @@ Object.assign(Lock.prototype, {
     var releaseScript = `
         local index = tonumber(ARGV[1]);
         if redis.call("EXISTS", KEYS[1]) == 0 then
-          return {1, "expired", "expired", 0};
+          return {1, "expired", "expired"};
         end;
         local data = {
-          ["index"]=tonumber(redis.call("HGET", KEYS[1], "index"))
+          ["index"]=tonumber(redis.call("HGET", KEYS[1], "index")),
+          ["counter"]=tonumber(redis.call("HGET", KEYS[1], "counter"))
         };
         if data.index == index then
-          redis.call("DEL", KEYS[1]);
+          if data.counter == 1 then
+            redis.call("DEL", KEYS[1]);
+          else
+            redis.call("HINCRBY", KEYS[1], "counter", -1);
+          end
           -- Notify potential queue that this lock is now freed
           redis.call("PUBLISH", "${this._namespace}-release", KEYS[1]);
           return {1, "released", data.index};
@@ -143,7 +177,7 @@ Object.assign(Lock.prototype, {
           id: lock.id,
           success: !!evalResponse[0],
           result: evalResponse[1],
-          index: evalResponse[2]
+          index: evalResponse[2],
         };
         done(null, response);
       });
